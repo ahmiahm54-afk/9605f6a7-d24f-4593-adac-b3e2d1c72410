@@ -1,0 +1,1233 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="ar" dir="rtl"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>الذكاء الاصطناعي في إدارة حشود الحج والعمرة</title>
+<style>
+  :root {
+    --green-900: #2e1c0f;
+    --green-800: #3d2716;
+    --green-700: #4d3220;
+    --green-600: #66432b;
+    --green-500: #7a5436;
+    --green-100: #f1e9e0;
+    --green-50: #f8f3ed;
+    --gold-700: #8a6d1f;
+    --gold-600: #b08d2b;
+    --gold-500: #c9a23a;
+    --gold-400: #d9b95c;
+    --gold-100: #f7eed0;
+    --gold-50: #fbf6e6;
+    --cream: #fbf8f3;
+    --ink: #2b241f;
+    --ink-soft: #56504a;
+    --border-soft: rgba(102, 67, 43, 0.18);
+    --shadow-soft: 0 4px 16px rgba(61, 39, 22, 0.08);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Tahoma', 'Segoe UI', 'Arial', sans-serif;
+    background: var(--cream);
+    color: var(--ink);
+    line-height: 1.8;
+  }
+
+  .container { max-width: 1100px; margin: 0 auto; padding: 0 20px; }
+
+  /* ===== Header ===== */
+  header {
+    background: linear-gradient(135deg, var(--green-900) 0%, var(--green-700) 100%);
+    color: var(--gold-100);
+    padding: 18px 0 60px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  header::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background-image:
+      repeating-linear-gradient(45deg, rgba(201,162,58,0.05) 0px, rgba(201,162,58,0.05) 2px, transparent 2px, transparent 40px);
+    pointer-events: none;
+  }
+
+  .pages-bar {
+    background: rgba(0,0,0,0.18);
+    border-bottom: 1px solid rgba(201,162,58,0.25);
+    padding: 10px 0;
+    font-size: 13px;
+    text-align: center;
+    color: var(--gold-400);
+  }
+  .pages-bar a { color: var(--gold-400); text-decoration: underline; }
+  .pages-bar .badge {
+    display: inline-block;
+    background: rgba(201,162,58,0.18);
+    border: 1px dashed var(--gold-500);
+    border-radius: 6px;
+    padding: 2px 10px;
+    margin-right: 6px;
+    font-size: 12px;
+  }
+
+  .header-content { position: relative; z-index: 1; text-align: center; padding-top: 36px; }
+
+  .header-eyebrow {
+    font-size: 13px;
+    letter-spacing: 1px;
+    color: var(--gold-500);
+    text-transform: uppercase;
+    margin-bottom: 14px;
+  }
+
+  .header-eyebrow span { margin: 0 6px; }
+
+  h1 {
+    font-size: 30px;
+    font-weight: 700;
+    color: #fff;
+    margin-bottom: 10px;
+    line-height: 1.5;
+  }
+
+  .header-sub {
+    font-size: 16px;
+    color: var(--gold-100);
+    opacity: 0.85;
+    max-width: 640px;
+    margin: 0 auto 28px;
+  }
+
+  .meta-row {
+    display: flex;
+    justify-content: center;
+    gap: 14px;
+    flex-wrap: wrap;
+    font-size: 13px;
+  }
+
+  .meta-pill {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(201,162,58,0.35);
+    border-radius: 30px;
+    padding: 7px 18px;
+    color: var(--gold-100);
+  }
+
+  .meta-pill b { color: var(--gold-400); font-weight: 700; }
+
+  /* ===== Nav dots / section wrapper ===== */
+  main { padding: 0 0 60px; }
+
+  section {
+    padding: 56px 0;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  section:last-of-type { border-bottom: none; }
+
+  .section-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12.5px;
+    color: var(--green-600);
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+  }
+  .section-label::before {
+    content: '';
+    width: 18px;
+    height: 2px;
+    background: var(--gold-500);
+    display: inline-block;
+  }
+
+  h2 {
+    font-size: 25px;
+    color: var(--green-800);
+    margin-bottom: 18px;
+    font-weight: 700;
+  }
+
+  h3 {
+    font-size: 18px;
+    color: var(--green-700);
+    margin: 22px 0 10px;
+    font-weight: 700;
+  }
+
+  p { color: var(--ink-soft); font-size: 15.5px; margin-bottom: 14px; max-width: 880px; }
+
+  .lead {
+    font-size: 17px;
+    color: var(--ink);
+    border-right: 3px solid var(--gold-500);
+    padding-right: 16px;
+    margin-bottom: 22px;
+    max-width: 880px;
+  }
+
+  /* ===== Stat cards ===== */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-top: 28px;
+  }
+
+  .stat-card {
+    background: #fff;
+    border: 1px solid var(--border-soft);
+    border-top: 3px solid var(--gold-500);
+    border-radius: 10px;
+    padding: 20px 16px;
+    text-align: center;
+    box-shadow: var(--shadow-soft);
+  }
+
+  .stat-num {
+    font-size: 26px;
+    font-weight: 700;
+    color: var(--green-700);
+    margin-bottom: 4px;
+  }
+
+  .stat-label {
+    font-size: 13px;
+    color: var(--ink-soft);
+  }
+
+  /* ===== Comparison table ===== */
+  .compare-wrap { overflow-x: auto; margin-top: 20px; }
+
+  table.compare {
+    width: 100%;
+    border-collapse: collapse;
+    background: #fff;
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: var(--shadow-soft);
+    min-width: 640px;
+  }
+
+  table.compare th {
+    background: var(--green-800);
+    color: var(--gold-100);
+    font-size: 14px;
+    padding: 14px 16px;
+    text-align: right;
+    font-weight: 700;
+  }
+
+  table.compare th:first-child { background: var(--green-900); }
+
+  table.compare td {
+    padding: 14px 16px;
+    font-size: 14px;
+    color: var(--ink-soft);
+    border-bottom: 1px solid var(--border-soft);
+    vertical-align: top;
+  }
+
+  table.compare tr:last-child td { border-bottom: none; }
+
+  table.compare td:first-child {
+    font-weight: 700;
+    color: var(--green-800);
+    background: var(--green-50);
+    white-space: nowrap;
+  }
+
+  table.compare tr:nth-child(even) td:not(:first-child) { background: var(--gold-50); }
+
+  /* ===== Receptive field diagram ===== */
+  .diagram-box {
+    background: #fff;
+    border: 1px solid var(--border-soft);
+    border-radius: 12px;
+    padding: 28px 20px;
+    box-shadow: var(--shadow-soft);
+    margin-top: 20px;
+  }
+
+  .diagram-cols {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+    margin-top: 8px;
+  }
+
+  .diagram-col h4 {
+    text-align: center;
+    font-size: 14.5px;
+    color: var(--green-800);
+    font-weight: 700;
+    margin-bottom: 4px;
+  }
+  .diagram-col .sub {
+    text-align: center;
+    font-size: 12.5px;
+    color: var(--ink-soft);
+    margin-bottom: 12px;
+  }
+
+  /* ===== Timeline ===== */
+  .timeline {
+    position: relative;
+    margin-top: 30px;
+    padding-right: 28px;
+    border-right: 2px solid var(--gold-500);
+  }
+
+  .tl-item { position: relative; padding-bottom: 30px; }
+  .tl-item:last-child { padding-bottom: 0; }
+
+  .tl-item::before {
+    content: '';
+    position: absolute;
+    right: -34px;
+    top: 4px;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--gold-500);
+    border: 3px solid var(--cream);
+    box-shadow: 0 0 0 2px var(--green-700);
+  }
+
+  .tl-year {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--gold-700);
+    margin-bottom: 4px;
+  }
+
+  .tl-title { font-size: 16px; font-weight: 700; color: var(--green-800); margin-bottom: 4px; }
+  .tl-desc { font-size: 14.5px; color: var(--ink-soft); max-width: 720px; }
+
+  /* ===== Case study cards ===== */
+  .cases-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 18px;
+    margin-top: 24px;
+  }
+
+  .case-card {
+    background: #fff;
+    border: 1px solid var(--border-soft);
+    border-radius: 12px;
+    padding: 22px;
+    box-shadow: var(--shadow-soft);
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+  .case-card:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 8px 22px rgba(18,61,41,0.14);
+  }
+
+  .case-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    background: var(--green-800);
+    color: var(--gold-400);
+    font-weight: 700;
+    font-size: 14px;
+    margin-bottom: 12px;
+  }
+
+  .case-title { font-size: 17px; font-weight: 700; color: var(--green-800); margin-bottom: 8px; }
+
+  .case-tag {
+    display: inline-block;
+    background: var(--gold-100);
+    color: var(--gold-700);
+    font-size: 11.5px;
+    font-weight: 700;
+    padding: 3px 10px;
+    border-radius: 20px;
+    margin-bottom: 10px;
+  }
+
+  .case-card p { font-size: 14px; margin-bottom: 8px; }
+  .case-card .case-label { font-weight: 700; color: var(--green-700); }
+
+  .case-card.wide { grid-column: 1 / -1; }
+
+  /* ===== Models section ===== */
+  .model-row {
+    display: grid;
+    grid-template-columns: 200px 1fr;
+    gap: 20px;
+    margin-bottom: 22px;
+    background: #fff;
+    border: 1px solid var(--border-soft);
+    border-radius: 10px;
+    padding: 18px 20px;
+    box-shadow: var(--shadow-soft);
+  }
+
+  .model-name {
+    font-weight: 700;
+    color: var(--green-800);
+    font-size: 15px;
+    display: flex;
+    align-items: center;
+  }
+
+  .model-desc p { margin-bottom: 6px; font-size: 14.5px; }
+
+  /* ===== Challenges grid ===== */
+  .challenges-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+    margin-top: 22px;
+  }
+
+  .challenge-card {
+    background: var(--green-50);
+    border-right: 3px solid var(--green-600);
+    border-radius: 8px;
+    padding: 16px 18px;
+  }
+
+  .challenge-card.gold { border-right-color: var(--gold-500); }
+
+  .challenge-card h4 { font-size: 14.5px; color: var(--green-800); margin-bottom: 6px; font-weight: 700; }
+  .challenge-card p { font-size: 13.5px; margin: 0; }
+
+  /* ===== References ===== */
+  .ref-list { margin-top: 16px; }
+  .ref-list li {
+    font-size: 13.5px;
+    color: var(--ink-soft);
+    margin-bottom: 10px;
+    padding-right: 18px;
+    position: relative;
+  }
+  .ref-list li::before {
+    content: '◆';
+    position: absolute;
+    right: 0;
+    color: var(--gold-500);
+    font-size: 10px;
+    top: 4px;
+  }
+  .ref-list a { color: var(--green-600); }
+
+  footer {
+    background: var(--green-900);
+    color: var(--gold-100);
+    text-align: center;
+    padding: 30px 0;
+    font-size: 13px;
+  }
+  footer .gold { color: var(--gold-400); font-weight: 700; }
+
+  @media (max-width: 800px) {
+    .stats-grid { grid-template-columns: repeat(2, 1fr); }
+    .diagram-cols { grid-template-columns: 1fr; }
+    .cases-grid { grid-template-columns: 1fr; }
+    .case-card.wide { grid-column: auto; }
+    .model-row { grid-template-columns: 1fr; }
+    .challenges-grid { grid-template-columns: 1fr; }
+    h1 { font-size: 23px; }
+    h2 { font-size: 21px; }
+    .container { padding: 0 16px; }
+  }
+</style>
+</head>
+<body lang="ar" dir="rtl" id="artifacts-component-root-html">
+
+<header>
+  <div class="pages-bar">
+    <span class="badge">رابط GitHub Pages</span>
+    <a href="https://www.claudeusercontent.com/artifact/9605f6a7-d24f-4593-adac-b3e2d1c72410?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true&amp;routeHandlerPdf=true#" onclick="return false;">https://[اسم-المستخدم].github.io/hajj-crowd-ai-vit/ — استبدل هذا الرابط بعد النشر</a>
+  </div>
+  <div class="container header-content">
+    <div class="header-eyebrow">Advanced Deep Learning<span>•</span>مشروع بحثي<span>•</span>بكالوريوس</div>
+    <h1>الذكاء الاصطناعي في صناعة السياحة الدينية<br>إدارة حشود الحج والعمرة</h1>
+    <p class="header-sub">دراسة تطبيقية على معمارية محولات الرؤية (Vision Transformers) في تقدير كثافة الحشود وتوجيه المسارات استباقياً</p>
+    <div class="meta-row">
+      <div class="meta-pill">الطالب: <b>أحمد عيدروس أحمد العطاس</b></div>
+      <div class="meta-pill">الرقم الجامعي: <b>444015439</b></div>
+      <div class="meta-pill">المشرف: <b>د. أحمد الهندي</b></div>
+      <div class="meta-pill">التاريخ: <b>19 يونيو 2026</b></div>
+    </div>
+  </div>
+</header>
+
+<main class="container">
+
+  <section id="summary">
+    <div class="section-label">الملخص التنفيذي</div>
+    <h2>تحوّل من المراقبة التفاعلية إلى الإدارة التنبؤية</h2>
+    <p class="lead">يتجاوز عدد الحجاج سنوياً نحو مليوني شخص يتزاحمون في مساحات محدودة كالمطاف والجمرات. تستعرض هذه الدراسة كيف يُحدث الذكاء الاصطناعي — وخصوصاً معمارية محولات الرؤية (ViT) — تحولاً جوهرياً في إدارة هذا الحشد، مقارنةً بالشبكات العصبية الالتفافية (CNN) التقليدية.</p>
+    <p>تتفوق محولات الرؤية على الشبكات الالتفافية في معالجة التداخل البصري الشديد بفضل آلية الانتباه الذاتي التي توفر مجال استقبال شامل للمشهد بأكمله، بما يخدم رؤية المملكة 2030 الطموحة لاستيعاب ثلاثين مليون معتمر وحاج سنوياً. كما تكشف المقارنة مع تجربة كومب ميلا الهندي أن الحلول التقنية تتقارب عالمياً أمام تحدٍ متشابه.</p>
+
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-num">+2 مليون</div>
+        <div class="stat-label">حاج سنوياً من +180 دولة</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-num">30 ألف</div>
+        <div class="stat-label">طائف يُرصدون لحظياً في المطاف</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-num">+5000</div>
+        <div class="stat-label">كاميرا في 80 موقعاً (Sawaher)</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-num">30 مليون</div>
+        <div class="stat-label">هدف رؤية 2030 من المعتمرين والحجاج</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="compare">
+    <div class="section-label">القسم الثالث</div>
+    <h2>الذكاء الاصطناعي التقليدي مقابل التوليدي</h2>
+    <p>يتمايز الذكاء الاصطناعي في هذا القطاع إلى مسارين متكاملين لا متنافسين: مسار تنبؤي يصنّف ويتنبأ بحالة الحشد، ومسار توليدي ينشئ بيئات ومحتوى تحليلياً جديداً.</p>
+
+    <div class="compare-wrap">
+      <table class="compare">
+        <tbody><tr>
+          <th>وجه المقارنة</th>
+          <th>Predictive AI</th>
+          <th>Generative AI</th>
+        </tr>
+        <tr>
+          <td>الهدف الأساسي</td>
+          <td>تصنيف وتنبؤ بحالة قائمة بالفعل في البيانات</td>
+          <td>إنشاء محتوى أو بيئات جديدة لم تكن موجودة (محاكاة، نصوص تحليلية)</td>
+        </tr>
+        <tr>
+          <td>أمثلة على المهام</td>
+          <td>تقدير كثافة الحشد، كشف التكتلات الخطرة، التنبؤ بنقاط الازدحام</td>
+          <td>محاكاة المشاعر المقدسة بتوائم رقمية، توليد تقارير تحليلية فورية</td>
+        </tr>
+        <tr>
+          <td>النماذج المستخدمة</td>
+          <td>محولات الرؤية (ViT)، الشبكات الالتفافية (CNN)، YOLO</td>
+          <td>نماذج اللغة الكبيرة (LLMs)، محركات المحاكاة الفيزيائية</td>
+        </tr>
+        <tr>
+          <td>أبرز الجهات</td>
+          <td>سدايا (Baseer / Sawaher)، جامعة أم القرى، DHCDCNNet</td>
+          <td>سدايا (مكوّن توليد التقارير في Baseer)، مبادرة Digital Kumbh الهندية</td>
+        </tr>
+      </tbody></table>
+    </div>
+  </section>
+
+  <section id="vit-diagram">
+    <div class="section-label">القسم الرابع</div>
+    <h2>لماذا تتفوق ViT على CNN في الحشود الكثيفة؟</h2>
+    <p>الفارق الجوهري يكمن في «مجال الاستقبال» (Receptive Field): مدى ما تستطيع كل نقطة في الصورة «رؤيته» من باقي المشهد لفهم السياق الكامل.</p>
+
+    <div class="diagram-box">
+      <div class="diagram-cols">
+        <div class="diagram-col">
+          <h4>CNN — مجال استقبال محدود</h4>
+          <p class="sub">كل نواة ترى نافذة صغيرة محيطة فقط</p>
+        </div>
+        <div class="diagram-col">
+          <h4>ViT — مجال استقبال شامل</h4>
+          <p class="sub">كل رقعة "تنتبه" لجميع رقع الصورة فوراً</p>
+        </div>
+      </div>
+      <div id="receptive-svg-wrap"><svg viewBox="0 0 680 300" width="100%" role="img" style="display: block; max-width: 680px; margin: 0px auto;"><g><line x1="60" y1="30" x2="60" y2="210" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="60" y1="30" x2="240" y2="30" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="90" y1="30" x2="90" y2="210" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="60" y1="60" x2="240" y2="60" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="120" y1="30" x2="120" y2="210" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="60" y1="90" x2="240" y2="90" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="150" y1="30" x2="150" y2="210" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="60" y1="120" x2="240" y2="120" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="180" y1="30" x2="180" y2="210" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="60" y1="150" x2="240" y2="150" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="210" y1="30" x2="210" y2="210" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="60" y1="180" x2="240" y2="180" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="240" y1="30" x2="240" y2="210" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="60" y1="210" x2="240" y2="210" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line></g><rect x="105" y="75" width="90" height="90" fill="rgba(201,162,58,0.18)" stroke="#c9a23a" stroke-width="1.5" rx="3"></rect><circle cx="150" cy="120" r="5" fill="#66432b"></circle><text x="150" y="236" text-anchor="middle" font-size="12.5" fill="#56504a">النافذة المحلية فقط (3×3 رقع)</text><g><line x1="400" y1="30" x2="400" y2="210" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="400" y1="30" x2="580" y2="30" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="430" y1="30" x2="430" y2="210" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="400" y1="60" x2="580" y2="60" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="460" y1="30" x2="460" y2="210" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="400" y1="90" x2="580" y2="90" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="490" y1="30" x2="490" y2="210" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="400" y1="120" x2="580" y2="120" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="520" y1="30" x2="520" y2="210" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="400" y1="150" x2="580" y2="150" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="550" y1="30" x2="550" y2="210" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="400" y1="180" x2="580" y2="180" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="580" y1="30" x2="580" y2="210" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line><line x1="400" y1="210" x2="580" y2="210" stroke="rgba(102,67,43,0.25)" stroke-width="1"></line></g><line x1="490" y1="120" x2="400" y2="30" stroke="#c9a23a" stroke-width="1" opacity="0.14"></line><line x1="490" y1="120" x2="400" y2="60" stroke="#c9a23a" stroke-width="1" opacity="0.17"></line><line x1="490" y1="120" x2="400" y2="90" stroke="#c9a23a" stroke-width="1" opacity="0.19"></line><line x1="490" y1="120" x2="400" y2="120" stroke="#c9a23a" stroke-width="1" opacity="0.20"></line><line x1="490" y1="120" x2="400" y2="150" stroke="#c9a23a" stroke-width="1" opacity="0.19"></line><line x1="490" y1="120" x2="400" y2="180" stroke="#c9a23a" stroke-width="1" opacity="0.17"></line><line x1="490" y1="120" x2="400" y2="210" stroke="#c9a23a" stroke-width="1" opacity="0.14"></line><line x1="490" y1="120" x2="430" y2="30" stroke="#c9a23a" stroke-width="1" opacity="0.17"></line><line x1="490" y1="120" x2="430" y2="60" stroke="#c9a23a" stroke-width="1" opacity="0.21"></line><line x1="490" y1="120" x2="430" y2="90" stroke="#c9a23a" stroke-width="1" opacity="0.24"></line><line x1="490" y1="120" x2="430" y2="120" stroke="#c9a23a" stroke-width="1" opacity="0.25"></line><line x1="490" y1="120" x2="430" y2="150" stroke="#c9a23a" stroke-width="1" opacity="0.24"></line><line x1="490" y1="120" x2="430" y2="180" stroke="#c9a23a" stroke-width="1" opacity="0.21"></line><line x1="490" y1="120" x2="430" y2="210" stroke="#c9a23a" stroke-width="1" opacity="0.17"></line><line x1="490" y1="120" x2="460" y2="30" stroke="#c9a23a" stroke-width="1" opacity="0.19"></line><line x1="490" y1="120" x2="460" y2="60" stroke="#c9a23a" stroke-width="1" opacity="0.24"></line><line x1="490" y1="120" x2="460" y2="90" stroke="#c9a23a" stroke-width="1" opacity="0.28"></line><line x1="490" y1="120" x2="460" y2="120" stroke="#c9a23a" stroke-width="1" opacity="0.30"></line><line x1="490" y1="120" x2="460" y2="150" stroke="#c9a23a" stroke-width="1" opacity="0.28"></line><line x1="490" y1="120" x2="460" y2="180" stroke="#c9a23a" stroke-width="1" opacity="0.24"></line><line x1="490" y1="120" x2="460" y2="210" stroke="#c9a23a" stroke-width="1" opacity="0.19"></line><line x1="490" y1="120" x2="490" y2="30" stroke="#c9a23a" stroke-width="1" opacity="0.20"></line><line x1="490" y1="120" x2="490" y2="60" stroke="#c9a23a" stroke-width="1" opacity="0.25"></line><line x1="490" y1="120" x2="490" y2="90" stroke="#c9a23a" stroke-width="1" opacity="0.30"></line><line x1="490" y1="120" x2="490" y2="150" stroke="#c9a23a" stroke-width="1" opacity="0.30"></line><line x1="490" y1="120" x2="490" y2="180" stroke="#c9a23a" stroke-width="1" opacity="0.25"></line><line x1="490" y1="120" x2="490" y2="210" stroke="#c9a23a" stroke-width="1" opacity="0.20"></line><line x1="490" y1="120" x2="520" y2="30" stroke="#c9a23a" stroke-width="1" opacity="0.19"></line><line x1="490" y1="120" x2="520" y2="60" stroke="#c9a23a" stroke-width="1" opacity="0.24"></line><line x1="490" y1="120" x2="520" y2="90" stroke="#c9a23a" stroke-width="1" opacity="0.28"></line><line x1="490" y1="120" x2="520" y2="120" stroke="#c9a23a" stroke-width="1" opacity="0.30"></line><line x1="490" y1="120" x2="520" y2="150" stroke="#c9a23a" stroke-width="1" opacity="0.28"></line><line x1="490" y1="120" x2="520" y2="180" stroke="#c9a23a" stroke-width="1" opacity="0.24"></line><line x1="490" y1="120" x2="520" y2="210" stroke="#c9a23a" stroke-width="1" opacity="0.19"></line><line x1="490" y1="120" x2="550" y2="30" stroke="#c9a23a" stroke-width="1" opacity="0.17"></line><line x1="490" y1="120" x2="550" y2="60" stroke="#c9a23a" stroke-width="1" opacity="0.21"></line><line x1="490" y1="120" x2="550" y2="90" stroke="#c9a23a" stroke-width="1" opacity="0.24"></line><line x1="490" y1="120" x2="550" y2="120" stroke="#c9a23a" stroke-width="1" opacity="0.25"></line><line x1="490" y1="120" x2="550" y2="150" stroke="#c9a23a" stroke-width="1" opacity="0.24"></line><line x1="490" y1="120" x2="550" y2="180" stroke="#c9a23a" stroke-width="1" opacity="0.21"></line><line x1="490" y1="120" x2="550" y2="210" stroke="#c9a23a" stroke-width="1" opacity="0.17"></line><line x1="490" y1="120" x2="580" y2="30" stroke="#c9a23a" stroke-width="1" opacity="0.14"></line><line x1="490" y1="120" x2="580" y2="60" stroke="#c9a23a" stroke-width="1" opacity="0.17"></line><line x1="490" y1="120" x2="580" y2="90" stroke="#c9a23a" stroke-width="1" opacity="0.19"></line><line x1="490" y1="120" x2="580" y2="120" stroke="#c9a23a" stroke-width="1" opacity="0.20"></line><line x1="490" y1="120" x2="580" y2="150" stroke="#c9a23a" stroke-width="1" opacity="0.19"></line><line x1="490" y1="120" x2="580" y2="180" stroke="#c9a23a" stroke-width="1" opacity="0.17"></line><line x1="490" y1="120" x2="580" y2="210" stroke="#c9a23a" stroke-width="1" opacity="0.14"></line><circle cx="490" cy="120" r="5" fill="#66432b"></circle><text x="490" y="236" text-anchor="middle" font-size="12.5" fill="#56504a">انتباه مباشر لكل رقع الصورة</text></svg></div>
+      <p style="margin-top:14px; font-size:13.5px; text-align:center; color:var(--ink-soft);">في حشد كثيف كمنطقة المطاف، يساعد المجال الشامل في ViT على الاستدلال على فرد محجوب جزئياً من خلال السياق العام للمشهد — وهو ما تعجز عنه نوافذ CNN الصغيرة دون تكديس طبقات كثيرة.</p>
+    </div>
+  </section>
+
+  <section id="timeline">
+    <div class="section-label">حالة دراسية رائدة</div>
+    <h2>تطور منظومة سدايا لإدارة حشود الحج</h2>
+    <div class="timeline">
+      <div class="tl-item">
+        <div class="tl-year">2019</div>
+        <div class="tl-title">بدايات الأبحاث الأكاديمية</div>
+        <div class="tl-desc">بناء مجموعة بيانات HAJJ-Crowd من بث تلفزيوني مباشر لطقوس الطواف، ونماذج CNN أولى كـ DHCDCNNet وFCNN لتصنيف كثافة الحشود إلى خمس فئات.</div>
+      </div>
+      <div class="tl-item">
+        <div class="tl-year">2021–2023</div>
+        <div class="tl-title">دخول محولات الرؤية للبحث العلمي</div>
+        <div class="tl-desc">نشر أوراق CCTrans وTransCrowd وCrowdFormer التي تستخدم عمود فقري من نوع محول الرؤية الهرمي لعدّ الحشود، محققة نتائج متقدمة على معايير قياسية.</div>
+      </div>
+      <div class="tl-item">
+        <div class="tl-year">2025م / 1446هـ</div>
+        <div class="tl-title">إطلاق منصة Baseer وتكاملها مع Sawaher</div>
+        <div class="tl-desc">تطوّر سدايا بالتعاون مع وزارة الداخلية منصة Baseer لرصد أكثر من مليون حاج يومياً، بالتكامل مع Sawaher التي تشغّل 16 خوارزمية و31 لوحة بيانات.</div>
+      </div>
+      <div class="tl-item">
+        <div class="tl-year">2026م / 1447هـ</div>
+        <div class="tl-title">دمج نماذج اللغة الكبيرة لتوليد القرار</div>
+        <div class="tl-desc">تطوّر Baseer لتشمل LLMs تترجم التحليلات البصرية إلى تقارير نصية فورية للقادة الميدانيين، منتقلة من المراقبة التفاعلية إلى الإدارة التنبؤية.</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="models">
+    <div class="section-label">القسم الرابع</div>
+    <h2>النماذج التقنية المستخدمة</h2>
+
+    <div class="model-row">
+      <div class="model-name">① CNN</div>
+      <div class="model-desc">
+        <p>النموذج التأسيسي لعدّ الرؤوس ورسم خرائط الكثافة في الحشود متوسطة الكثافة. مثال: DHCDCNNet، شبكة التفافية متوسّعة مصمّمة خصيصاً لسياق الحج.</p>
+      </div>
+    </div>
+    <div class="model-row">
+      <div class="model-name">② ViT</div>
+      <div class="model-desc">
+        <p>تقسّم الصورة إلى رقع (Patches) وتعالجها بآلية الانتباه الذاتي، مما يمنحها مجال استقبال شامل يتغلب على التداخل البصري الشديد. أمثلة: CCTrans، CrowdFormer.</p>
+      </div>
+    </div>
+    <div class="model-row">
+      <div class="model-name">③ LLMs</div>
+      <div class="model-desc">
+        <p>طبقة توليدية أعلى من الرؤية الحاسوبية، تحوّل المخرجات البصرية الكمية إلى نص تحليلي قابل للتنفيذ الفوري من قِبل القادة الميدانيين، كما في منصة Baseer.</p>
+      </div>
+    </div>
+
+    <h3>نماذج إضافية محتملة مستقبلاً</h3>
+    <p>لم تتطرق دراسات الحالة الحالية في هذا القطاع إلى استخدام GAN أو RAG بشكل مباشر، لكن لهما إمكانات واعدة كامتداد مستقبلي للمنظومة:</p>
+
+    <div class="model-row">
+      <div class="model-name">④ GAN</div>
+      <div class="model-desc">
+        <p>الشبكات التوليدية التنافسية (Generative Adversarial Networks) يمكن أن تُستخدم مستقبلاً لتوليد بيانات تركيبية (Synthetic Data) تحاكي سيناريوهات ازدحام نادرة وخطيرة كبدايات التدافع، لتدريب نماذج تقدير الكثافة دون الحاجة لجمع بيانات حقيقية عن حوادث فعلية لأسباب أخلاقية وسلامة.</p>
+      </div>
+    </div>
+    <div class="model-row">
+      <div class="model-name">⑤ RAG</div>
+      <div class="model-desc">
+        <p>التوليد المعزَّز بالاسترجاع (Retrieval-Augmented Generation) يمكن أن يعزّز طبقة نماذج اللغة الكبيرة في منصات كـ Baseer، بربط التقارير النصية المولَّدة بمصادر بيانات لحظية موثّقة (سجلات الكاميرات، بيانات الطقس، الخرائط الحية)، مما يقلّل من مخاطر الاختلاق المعلوماتي (Hallucination) ويزيد دقة التوصيات المقدَّمة للقادة الميدانيين.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="cases">
+    <div class="section-label">القسم الخامس</div>
+    <h2>حالات دراسية حقيقية</h2>
+
+    <div class="cases-grid">
+      <div class="case-card wide">
+        <div class="case-num">١</div>
+        <span class="case-tag">سعودية — سدايا ووزارة الداخلية</span>
+        <div class="case-title">منصة Baseer</div>
+        <p><span class="case-label">التطبيق:</span> رصد وتحليل كثافة الحشود وحركتها في الزمن الحقيقي حول الحرمين الشريفين.</p>
+        <p><span class="case-label">التقنية:</span> رؤية حاسوبية + نماذج لغة كبيرة، بالتكامل مع منصة Sawaher (16 خوارزمية، 31 لوحة بيانات، +5000 كاميرا في 80 موقعاً).</p>
+        <p><span class="case-label">النتائج:</span> تتبّع أكثر من مليون حاج يومياً، وعدّ يصل إلى ثلاثين ألف طائف لحظياً، مع تسريع العثور على المفقودين.</p>
+      </div>
+
+      <div class="case-card">
+        <div class="case-num">٢</div>
+        <span class="case-tag">أكاديمية</span>
+        <div class="case-title">DHCDCNNet — HAJJ-Crowd</div>
+        <p><span class="case-label">التقنية:</span> شبكة التفافية متوسّعة لتقدير كثافة حشود الطواف من بث تلفزيوني 2019.</p>
+        <p><span class="case-label">النتائج:</span> تحسّن متوسط 82 نقطة في MAE و135.5 نقطة في MSE مقارنة بأساليب الحالة الراهنة وقت النشر.</p>
+      </div>
+
+      <div class="case-card">
+        <div class="case-num">٣</div>
+        <span class="case-tag">أكاديمية</span>
+        <div class="case-title">FCNN لتصنيف الكثافة</div>
+        <p><span class="case-label">التقنية:</span> شبكة التفافية كاملة دُرّبت على 27000 صورة موزعة على خمس فئات كثافة.</p>
+        <p><span class="case-label">النتائج:</span> تصنيف موثوق لكثافة الحشد، مع إعادة استخدام إطار العمل في أبحاث لاحقة عبر GitHub.</p>
+      </div>
+
+      <div class="case-card">
+        <div class="case-num">٤</div>
+        <span class="case-tag">جامعة أم القرى</span>
+        <div class="case-title">تخفيف الازدحام المروري</div>
+        <p><span class="case-label">التطبيق:</span> معالجة ازدحام نحو 250 ألف مركبة خلال موسم الحج بكاميرات ذكية وتحليلات لحظية.</p>
+        <p><span class="case-label">النتائج:</span> تحسّن في سلامة الطرق وكفاءة الاستجابة للطوارئ وجودة الهواء.</p>
+      </div>
+
+      <div class="case-card">
+        <div class="case-num">٥</div>
+        <span class="case-tag">دولية — مقارنة</span>
+        <div class="case-title">موكب كومب ميلا الهندي</div>
+        <p><span class="case-label">التطبيق:</span> تجمع ديني استقبل نحو 400 مليون زائر عام 2025، باستخدام كاميرات ومسيّرات وYOLO وByteTrack.</p>
+        <p><span class="case-label">النتائج:</span> مراقبة مركزية للموكب وتنبيهات تلقائية، ضمن مبادرة "الحج الرقمي" (Digital Kumbh).</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="challenges">
+    <div class="section-label">القسم السادس</div>
+    <h2>التحديات والمخاطر</h2>
+
+    <h3>تقنية</h3>
+    <div class="challenges-grid">
+      <div class="challenge-card">
+        <h4>شُح البيانات المُعلَّمة</h4>
+        <p>مجموعات بيانات الحج (1500–27000 صورة) محدودة الحجم مقارنة بما تحتاجه نماذج المحولات الكبيرة.</p>
+      </div>
+      <div class="challenge-card">
+        <h4>التعقيد الحسابي التربيعي</h4>
+        <p>حساب الانتباه الشامل بين كل الرقع يرفع كلفة الحوسبة بشدة عند المعالجة اللحظية لفيديو عالي الدقة.</p>
+      </div>
+      <div class="challenge-card">
+        <h4>قابلية التفسير والتحيّز</h4>
+        <p>يصعب فهم سبب تنبيه النموذج، وقد تفشل النماذج المُدرَّبة على مشاهد نهارية في الأداء ليلاً.</p>
+      </div>
+    </div>
+
+    <h3>أخلاقية وتنظيمية</h3>
+    <div class="challenges-grid">
+      <div class="challenge-card gold">
+        <h4>خصوصية الحجاج</h4>
+        <p>توتر مستمر بين التعرف على الوجوه لأغراض البحث عن المفقودين وحق الفرد في الخصوصية الروحانية.</p>
+      </div>
+      <div class="challenge-card gold">
+        <h4>المسؤولية القانونية</h4>
+        <p>من يتحمل المسؤولية إذا فشل نموذج تنبؤي في رصد ازدحام أدى إلى حادثة؟</p>
+      </div>
+      <div class="challenge-card gold">
+        <h4>الإطار التنظيمي</h4>
+        <p>تشريعات حوكمة الذكاء الاصطناعي في المراقبة الأمنية لا تزال أقل تفصيلاً من EU AI Act.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="future">
+    <div class="section-label">القسم السابع</div>
+    <h2>المستقبل المتوقع خلال خمس سنوات</h2>
+    <p>يُتوقع أن تتحول إدارة حشود الحج نحو نموذج "تنبؤي استباقي شامل" يدمج محولات الرؤية مع نماذج اللغة الكبيرة والتوائم الرقمية في منظومة واحدة متكاملة، مع توسّع المعماريات الهجينة (Hybrid CNN-Transformer) لموازنة الدقة والكلفة الحاسوبية. كما يُتوقع تحول دور القائد الميداني من "مراقب" إلى "مشغّل يراجع قرارات الذكاء الاصطناعي"، وبناء شراكات أوسع بين سدايا وجامعة أم القرى وKAUST، خدمة لهدف استقبال ثلاثين مليون معتمر وحاج سنوياً بحلول 2030.</p>
+  </section>
+
+  <section id="references">
+    <div class="section-label">المراجع المختارة</div>
+    <h2>مصادر أساسية للتحقق</h2>
+    <ul class="ref-list">
+      <li>Dosovitskiy, A. et al. (2021). An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale. arXiv:2010.11929</li>
+      <li>Tian, Y., Chu, X., &amp; Wang, H. (2021). CCTrans: Simplifying and Improving Crowd Counting with Transformer. <a href="https://arxiv.org/abs/2109.14483" target="_blank">arXiv:2109.14483</a></li>
+      <li>Crowd density estimation using deep learning for Hajj pilgrimage video analytics. <a href="https://pmc.ncbi.nlm.nih.gov/articles/PMC8787568/" target="_blank">PMC8787568</a></li>
+      <li>A deep crowd density classification model for Hajj pilgrimage using FCNN. <a href="https://pmc.ncbi.nlm.nih.gov/articles/PMC9044363/" target="_blank">PMC9044363</a></li>
+      <li>Gazzawe, F. &amp; Albahar, M. (2023). Reducing Traffic Congestion in Makkah During Hajj Through AI. Heliyon, DOI: 10.1016/j.heliyon.2023.e23304</li>
+      <li>Arab News (6 June 2025). How AI Tech Innovation Has Elevated the Hajj 2025 Pilgrimage Experience.</li>
+      <li>SPA (29 May 2026). Baseer Platform Reads Crowd Movement in Real Time.</li>
+      <li>Eastern Eye (22 January 2025). India Turns to AI for Crowd Management at Kumbh Mela.</li>
+      <li>الهيئة السعودية للبيانات والذكاء الاصطناعي (سدايا) — <a href="https://sdaia.gov.sa/" target="_blank">sdaia.gov.sa</a></li>
+    </ul>
+  </section>
+
+</main>
+
+<footer>
+  <div class="container">
+    <p>مشروع بحثي — Advanced Deep Learning &nbsp;|&nbsp; <span class="gold">أحمد عيدروس أحمد العطاس</span> &nbsp;|&nbsp; 444015439</p>
+  </div>
+</footer>
+
+<script>
+const svgNS = "http://www.w3.org/2000/svg";
+
+function buildReceptiveSVG() {
+  const wrap = document.getElementById('receptive-svg-wrap');
+  const isMobile = window.innerWidth < 800;
+  const svg = document.createElementNS(svgNS, "svg");
+  svg.setAttribute("viewBox", "0 0 680 300");
+  svg.setAttribute("width", "100%");
+  svg.setAttribute("role", "img");
+  svg.style.display = "block";
+  svg.style.maxWidth = "680px";
+  svg.style.margin = "0 auto";
+
+  const gridColor = "#66432b";
+  const gridLight = "rgba(102,67,43,0.25)";
+  const focusColor = "#c9a23a";
+
+  function makeGrid(offsetX, gridSize, cell, label) {
+    const g = document.createElementNS(svgNS, "g");
+    for (let i = 0; i <= gridSize; i++) {
+      const line1 = document.createElementNS(svgNS, "line");
+      line1.setAttribute("x1", offsetX + i * cell);
+      line1.setAttribute("y1", 30);
+      line1.setAttribute("x2", offsetX + i * cell);
+      line1.setAttribute("y2", 30 + gridSize * cell);
+      line1.setAttribute("stroke", gridLight);
+      line1.setAttribute("stroke-width", "1");
+      g.appendChild(line1);
+
+      const line2 = document.createElementNS(svgNS, "line");
+      line2.setAttribute("x1", offsetX);
+      line2.setAttribute("y1", 30 + i * cell);
+      line2.setAttribute("x2", offsetX + gridSize * cell);
+      line2.setAttribute("y2", 30 + i * cell);
+      line2.setAttribute("stroke", gridLight);
+      line2.setAttribute("stroke-width", "1");
+      g.appendChild(line2);
+    }
+    return g;
+  }
+
+  // Left: CNN limited receptive field
+  const cnnOffsetX = 60;
+  const cnnGridSize = 6;
+  const cnnCell = 30;
+  svg.appendChild(makeGrid(cnnOffsetX, cnnGridSize, cnnCell, "CNN"));
+
+  // center patch index 3,3 (0-indexed)
+  const cx = cnnOffsetX + 3 * cnnCell;
+  const cy = 30 + 3 * cnnCell;
+
+  // limited receptive field (small highlighted box around center, 3x3)
+  const rfRect = document.createElementNS(svgNS, "rect");
+  rfRect.setAttribute("x", cx - cnnCell * 1.5);
+  rfRect.setAttribute("y", cy - cnnCell * 1.5);
+  rfRect.setAttribute("width", cnnCell * 3);
+  rfRect.setAttribute("height", cnnCell * 3);
+  rfRect.setAttribute("fill", "rgba(201,162,58,0.18)");
+  rfRect.setAttribute("stroke", focusColor);
+  rfRect.setAttribute("stroke-width", "1.5");
+  rfRect.setAttribute("rx", "3");
+  svg.appendChild(rfRect);
+
+  // center point
+  const cnnCenter = document.createElementNS(svgNS, "circle");
+  cnnCenter.setAttribute("cx", cx);
+  cnnCenter.setAttribute("cy", cy);
+  cnnCenter.setAttribute("r", 5);
+  cnnCenter.setAttribute("fill", "#66432b");
+  svg.appendChild(cnnCenter);
+
+  const cnnLabel = document.createElementNS(svgNS, "text");
+  cnnLabel.setAttribute("x", cnnOffsetX + (cnnGridSize * cnnCell) / 2);
+  cnnLabel.setAttribute("y", 30 + cnnGridSize * cnnCell + 26);
+  cnnLabel.setAttribute("text-anchor", "middle");
+  cnnLabel.setAttribute("font-size", "12.5");
+  cnnLabel.setAttribute("fill", "#56504a");
+  cnnLabel.textContent = "النافذة المحلية فقط (3×3 رقع)";
+  svg.appendChild(cnnLabel);
+
+  // Right: ViT global receptive field
+  const vitOffsetX = 400;
+  const vitGridSize = 6;
+  const vitCell = 30;
+  svg.appendChild(makeGrid(vitOffsetX, vitGridSize, vitCell, "ViT"));
+
+  const vcx = vitOffsetX + 3 * vitCell;
+  const vcy = 30 + 3 * vitCell;
+
+  // lines from center to every other cell (sample grid points), faint
+  for (let i = 0; i <= vitGridSize; i++) {
+    for (let j = 0; j <= vitGridSize; j++) {
+      const tx = vitOffsetX + i * vitCell;
+      const ty = 30 + j * vitCell;
+      if (tx === vcx && ty === vcy) continue;
+      const dist = Math.hypot(tx - vcx, ty - vcy);
+      const opacity = Math.max(0.06, 0.35 - dist / 600);
+      const line = document.createElementNS(svgNS, "line");
+      line.setAttribute("x1", vcx);
+      line.setAttribute("y1", vcy);
+      line.setAttribute("x2", tx);
+      line.setAttribute("y2", ty);
+      line.setAttribute("stroke", focusColor);
+      line.setAttribute("stroke-width", "1");
+      line.setAttribute("opacity", opacity.toFixed(2));
+      svg.appendChild(line);
+    }
+  }
+
+  const vitCenter = document.createElementNS(svgNS, "circle");
+  vitCenter.setAttribute("cx", vcx);
+  vitCenter.setAttribute("cy", vcy);
+  vitCenter.setAttribute("r", 5);
+  vitCenter.setAttribute("fill", "#66432b");
+  svg.appendChild(vitCenter);
+
+  const vitLabel = document.createElementNS(svgNS, "text");
+  vitLabel.setAttribute("x", vitOffsetX + (vitGridSize * vitCell) / 2);
+  vitLabel.setAttribute("y", 30 + vitGridSize * vitCell + 26);
+  vitLabel.setAttribute("text-anchor", "middle");
+  vitLabel.setAttribute("font-size", "12.5");
+  vitLabel.setAttribute("fill", "#56504a");
+  vitLabel.textContent = "انتباه مباشر لكل رقع الصورة";
+  svg.appendChild(vitLabel);
+
+  wrap.innerHTML = "";
+  wrap.appendChild(svg);
+}
+
+buildReceptiveSVG();
+window.addEventListener('resize', buildReceptiveSVG);
+</script>
+
+
+
+</body></html>
